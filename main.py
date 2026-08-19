@@ -1,16 +1,31 @@
-# This is a sample Python script.
+import argparse
 
-# Press ⌃R to execute it or replace it with your code.
-# Press Double ⇧ to search everywhere for classes, files, tool windows, actions, and settings.
-
-
-def print_hi(name):
-    # Use a breakpoint in the code line below to debug your script.
-    print(f'Hi, {name}')  # Press ⌘F8 to toggle the breakpoint.
+from converter.pipeline import process_pdf
 
 
-# Press the green button in the gutter to run the script.
+def main():
+    ap = argparse.ArgumentParser(
+        description='Извлечение данных из PDF-каталога AccKee в XLSX.')
+    ap.add_argument('pdf', default='data/AccKee2025.pdf', nargs='?')
+    ap.add_argument('out', default='result.xlsx', nargs='?')
+    ap.add_argument('--pages', help='page ranges, 1-based inclusive, e.g. 4-5, 7, 12-13')
+    ap.add_argument('-v', '--verbose', action='store_true')
+    args = ap.parse_args()
+
+    pr = None
+    if args.pages:
+        ranges = []
+        for part in args.pages.split(','):
+            part = part.strip()
+            if '-' in part:
+                a, b = part.split('-')
+                ranges.append((int(a) - 1, int(b)))
+            else:
+                p = int(part)
+                ranges.append((p - 1, p))
+        pr = ranges
+    process_pdf(args.pdf, args.out, pr, args.verbose)
+
+
 if __name__ == '__main__':
-    print_hi('PyCharm')
-
-# See PyCharm help at https://www.jetbrains.com/help/pycharm/
+    main()
