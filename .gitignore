@@ -4,6 +4,7 @@ data/
 # Output artifacts
 result.xlsx
 *.xlsx.tmp
+/results/
 
 # Python
 __pycache__/
