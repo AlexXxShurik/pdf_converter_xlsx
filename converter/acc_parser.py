@@ -12,6 +12,7 @@ parse_page() возвращает список таблиц:
 }
 """
 import re
+from collections import defaultdict
 
 MODEL_RE = re.compile(
     r"^\d{1,2}[A-Z]{1,3}\d{2,3}(\.\d)?-\d{1,3}[A-Z]{1,4}\d{2,3}(?:/\d{2})?$"
@@ -58,6 +59,14 @@ def is_model(text):
                 or K2D_MODEL_RE.match(text) or MGU_MODEL_RE.match(text)
                 or TCAP_MODEL_RE.match(text))
 NUMBER_RE = re.compile(r"^\d+(?:\.\d+)?$")
+CODE_RE = re.compile(r'[-_/.]')
+ALNUM_RE = re.compile(r'[A-Za-z]\d')
+MISC_RE = re.compile(
+    r'^M\d+(?:\.\d+)?(?:-[-\d.]+)?[*x×]\d+$'  # M2.5*6, M4-0.7*16, M10-1.5*35
+    r'|^M\d+(?:\.\d+)?$'                       # M1.8, M2.2 (винт без длины)
+    r'|^[ΦT]\d+[x×]\d+$',                      # T5x160, Φ2.02x180
+    re.I)
+INSERT_RE = re.compile(r'\.\.|^CC|^TP|^TB|^TC|^SP|^WC')
 
 
 def _words(page):
@@ -66,6 +75,38 @@ def _words(page):
         out.append({'x0': x0, 'y0': y0, 'x1': x1, 'y1': y1,
                     'cx': (x0 + x1) / 2, 'cy': (y0 + y1) / 2, 'text': text})
     return _merge_tcap(out)
+
+
+def _page_tokens(page):
+    """Единый источник токенов страницы: текст где он есть, OCR где нет.
+
+    Основной источник — визуальный (OCR): покрывает страницы без текстового
+    слоя (52-83, таблицы нарисованы картинками). Текстовый слой — точные
+    значения: где есть текстовый токен, он заменяет перекрывающийся OCR-блок
+    (текст точнее: OCR сливает соседние ячейки `85.522 3` и обрезает модели).
+
+    Стратегия выбора источника по плотности текстового слоя:
+    - если текстовый слой даёт много кодов (>= 12) — он полный и точный,
+      используем ТОЛЬКО текст (OCR не нужен и только добавил бы шум);
+    - иначе (мало кодов — текст почти пустой) — OCR основной, текст подмешивается
+      как корректор там, где токены совпадают по позиции.
+    """
+    from converter.ocr_words import ocr_page
+    text = _words(page)
+    cands_text = _code_candidates(text)
+    if len(cands_text) >= 12:
+        return text
+    ocr = ocr_page(page)
+    merged = list(text)
+    for ob in ocr:
+        dup = any(abs(t['cx'] - ob['cx']) < 5 and abs(t['cy'] - ob['cy']) < 5
+                  for t in text)
+        if dup:
+            continue
+        ob = dict(ob)
+        ob['source'] = 'ocr'
+        merged.append(ob)
+    return merged
 
 
 TCAP_TOKEN_RE = re.compile(r"^\d{2}[RL]$")
@@ -164,8 +205,12 @@ def _table_vlines(page, x0, x1, data_y0=225.0, bottom=780.0):
 
 def _hlines_covering(page, cx, y0=190.0, y1=780.0):
     """Горизонтальные линии сетки, покрывающие x-центр колонки cx."""
+    return _hlines_covering_draws(page.get_drawings(), cx, y0, y1)
+
+
+def _hlines_covering_draws(draws, cx, y0=190.0, y1=780.0):
     ys = set()
-    for d in page.get_drawings():
+    for d in draws:
         for it in d['items']:
             if it[0] != 'l':
                 continue
@@ -188,7 +233,7 @@ def _find_sp_tables(page):
     Значения объединённых колонок (напр. type='SP' на 3 строки) дублируются
     на все строки диапазона.
     """
-    words = _words(page)
+    words = _page_tokens(page)
     draws = page.get_drawings()
     hlines = []
     for d in draws:
@@ -203,6 +248,8 @@ def _find_sp_tables(page):
             ax0, ax1 = sorted((a.x, b.x))
             if ax1 - ax0 < 150:
                 continue
+            if ax1 > 1208.0:
+                continue
             hlines.append((round(a.y, 1), round(ax0, 1), round(ax1, 1)))
     hlines.sort()
     result = []
@@ -215,6 +262,15 @@ def _find_sp_tables(page):
         if len(ys) < 2 or ys[-1] - ys[0] >= 60:
             continue
         y0, y1 = ys[0], ys[-1]
+        # настоящая SP-таблица имеет заголовки type/diameter/Blade model/Screw/
+        # Wrench в текстовом слое над верхней рамкой (нижние мини-таблицы
+        # инструментов/данных на стр. 58-72 такие заголовки не имеют)
+        hdr_words = ' '.join(w[4].lower() for w in page.get_text('words')
+                             if y0 - 25 <= w[3] <= y0
+                             and x0 <= w[0] <= x1)
+        if not any(k in hdr_words for k in ('type', 'diameter', 'blade',
+                                            'screw', 'wrench')):
+            continue
         # вертикальные линии внутри зоны данных (между рамками)
         vxs = set()
         for d in draws:
@@ -466,12 +522,13 @@ def _column_rows(table, page, words):
     это объединённая ячейка (значение дублируется на все строки интервала).
     Возвращает {cx: {'cells': [...], 'merged': bool}}.
     """
+    draws = page.get_drawings()
     out = {}
     y_lo = table['top'] - 1.0
     y_hi = table['bottom'] + 1.0
     for c in table['cols']:
         cx = c['cx']
-        hs = _hlines_covering(page, cx, y0=y_lo, y1=y_hi)
+        hs = _hlines_covering_draws(draws, cx, y0=y_lo, y1=y_hi)
         col_words = [w for w in words
                      if c['x0'] <= w['cx'] <= c['x1'] and y_lo <= w['cy'] <= y_hi]
         cells = []
@@ -494,11 +551,78 @@ def _join_tokens(tokens):
     return re.sub(r'\s*/\s*', '/', s)
 
 
+def _find_dim_table(page):
+    """Таблица размеров направляющих отверстий (стр. 83, 0-based 82).
+
+    Справочная таблица без колонки моделей: для диаметра направляющего
+    отверстия и LxD (глубины сверления) указана глубина отверстия для
+    диапазонов диаметров сверла. Значения — только в картинке (нет текстового
+    слоя) → OCR + сетка.
+    """
+    words = _page_tokens(page)
+    vs, hs = _geometry(page)
+    vx = sorted({round(x, 1) for x, ya, yb in vs
+                 if 160 < x < 580 and ya < 700 and yb > 490})
+    if not vx:
+        return None
+    # ряды по токенам LxD (ap.20xD..ap.60xD) ниже y 550 (основная таблица
+    # размеров для паяных гандрилл; выше есть вторая таблица для напайных)
+    lx = [w for w in words
+          if 289 < w['cx'] < 335 and re.match(r'^ap\.\d+xD$', w['text'])
+          and w['cy'] > 550]
+    if not lx:
+        return None
+    lx.sort(key=lambda w: w['cy'])
+    cols = [{'cx': 226.0, 'x0': 164.3, 'x1': 289.3, 'label': 'Diameter'},
+            {'cx': 311.0, 'x0': 289.3, 'x1': 333.6, 'label': 'LxD'},
+            {'cx': 364.0, 'x0': 333.6, 'x1': 395.5, 'label': '0.500-1.599'},
+            {'cx': 425.0, 'x0': 395.5, 'x1': 456.7, 'label': '1.600-3.999'},
+            {'cx': 487.0, 'x0': 456.7, 'x1': 517.9, 'label': '4.000-6.999'},
+            {'cx': 548.0, 'x0': 517.9, 'x1': 579.1, 'label': '7.000-12.000'}]
+    rows = []
+    # диаметры направляющего отверстия (0.500, 4.000, 4.001, 12.000) и допуски
+    # (+0.005, +0.010) — в левой колонке своими y-позициями; привязываем по
+    # порядку к первым рядам LxD (y-позиции не совпадают).
+    diams = sorted([w for w in words
+                    if 164 < w['cx'] < 240 and re.search(r'mm$', w['text'])
+                    and w['cy'] > 550], key=lambda w: w['cy'])
+    tols = sorted([w for w in words
+                   if 240 < w['cx'] < 290 and re.match(r'^[+±-]?\d', w['text'])
+                   and w['cy'] > 550], key=lambda w: w['cy'])
+    for i, l in enumerate(lx):
+        cy = l['cy']
+        dval = diams[i]['text'] if i < len(diams) else ''
+        tol = tols[i]['text'] if i < len(tols) else ''
+        vals = [f"{dval} {tol}".strip() if dval else '',
+                l['text']]
+        for x0, x1 in [(333.6, 395.5), (395.5, 456.7), (456.7, 517.9),
+                       (517.9, 579.1)]:
+            rr = sorted([w for w in words
+                         if x0 < w['cx'] < x1 and abs(w['cy'] - cy) < 15],
+                        key=lambda w: w['cx'])
+            vals.append(' '.join(w['text'] for w in rr))
+        rows.append(vals)
+    # убрать пустые хвостовые колонки (пустые диапазоны)
+    return {'x0': 164.3, 'x1': 579.1, 'cols': cols, 'rows': rows,
+            'top': min(l['cy'] for l in lx) - 60,
+            'bottom': max(l['cy'] for l in lx) + 15,
+            '_dim': True}
+
+
 def parse_page(page):
-    """Распознать одну страницу AccKee → список таблиц (dict)."""
-    words = _words(page)
-    tables = _find_tables(page)
+    """Распознать одну страницу AccKee → список таблиц (dict).
+
+    Единый универсальный метод для всех страниц каталога: колонки кодов
+    (текстовый фактор) + x-диапазон по горизонтальным сегментам сетки
+    (визуальный фактор). Работает и для сверлильных (2D/3D/KOD/KSD), и для
+    новых серий 30-83 (SEM/HCD/TWN/EWN/гандриллы) без разделения по страницам.
+    """
+    words = _page_tokens(page)
+    tables = _v2_find_tables(page, words)
     tables += _find_sp_tables(page)
+    dim = _find_dim_table(page)
+    if dim:
+        tables.append(dim)
     result = []
     for t in tables:
         if t.get('sp'):
@@ -509,7 +633,13 @@ def parse_page(page):
                 c['label'] = lab
             result.append(t)
             continue
-        models = _table_models(t, words)
+        if t.get('_dim'):
+            result.append(t)
+            continue
+        if t.get('_v2'):
+            models = sorted(t['models'], key=lambda w: w['cy'])
+        else:
+            models = _table_models(t, words)
         if not models:
             continue
         colinfo = _column_rows(t, page, words)
@@ -582,3 +712,267 @@ def parse_page(page):
         if not dup:
             final.append(a)
     return final
+
+
+def _code_candidates(words, y_lo=150.0, y_hi=790.0):
+    """Токены-«коды» (буквы+цифры, len>=4, есть спецсимвол или чередование).
+
+    Это первичный фактор двухфакторного поиска: модели разных серий каталога
+    (SEM, HCD, VMD, TWN/EWN, YLMD, CKB, гандриллы и т.д.) не описываются
+    единым жёстким регексом, но почти всегда выглядят как «код». Числовые
+    Spec-коды (420-28, TRACK DRILL стр. 52) — отдельный случай (без букв).
+    """
+    out = []
+    for w in words:
+        t = w['text']
+        if len(t) < 4:
+            continue
+        if re.search(r'[\u4e00-\u9fff]', t):
+            continue
+        if re.fullmatch(r'\d{2,}-\d{2,}', t):  # 420-28, 315-30
+            if y_lo <= w['cy'] <= y_hi:
+                out.append(w)
+            continue
+        if not re.search(r'[A-Za-z]', t) or not re.search(r'\d', t):
+            continue
+        if not (CODE_RE.search(t) or ALNUM_RE.search(t)):
+            continue
+        if y_lo <= w['cy'] <= y_hi:
+            out.append(w)
+    return out
+
+
+def _cluster_x(tokens, tol=12.0):
+    """Сгруппировать токены в колонки по близости x-центра."""
+    tokens = sorted(tokens, key=lambda w: w['cx'])
+    cl = []
+    for t in tokens:
+        for c in cl:
+            if abs(t['cx'] - c['cx']) <= tol:
+                n = len(c['tokens'])
+                c['cx'] = (c['cx'] * n + t['cx']) / (n + 1)
+                c['tokens'].append(t)
+                break
+        else:
+            cl.append({'cx': t['cx'], 'tokens': [t]})
+    return cl
+
+
+def _blocks_by_y(tokens, gap=45.0):
+    """Разбить токены колонки на блоки (таблицы) по разрыву по y."""
+    tokens = sorted(tokens, key=lambda w: w['cy'])
+    blocks = [[tokens[0]]]
+    for t in tokens[1:]:
+        if t['cy'] - blocks[-1][-1]['cy'] > gap:
+            blocks.append([t])
+        else:
+            blocks[-1].append(t)
+    return blocks
+
+
+def _geometry(page):
+    """Вертикальные (vs) и горизонтальные (hs) сегменты сетки.
+
+    Линии + рёбра rect-фигур (часть страниц 30-83 нарисована прямоугольниками
+    ячеек, а не линиями). hs: (x0, x1, y); vs: (x, y0, y1).
+    """
+    vs = []
+    hs = []
+    for d in page.get_drawings():
+        for it in d['items']:
+            if it[0] == 'l':
+                a, b = it[1], it[2]
+                if abs(a.y - b.y) <= 0.5 and abs(b.x - a.x) >= 10:
+                    hs.append((min(a.x, b.x), max(a.x, b.x), a.y))
+                elif abs(a.x - b.x) <= 0.5 and abs(b.y - a.y) >= 8:
+                    vs.append((a.x, min(a.y, b.y), max(a.y, b.y)))
+            elif it[0] == 're':
+                r = it[1]
+                if r.y1 - r.y0 < 8 or r.x1 - r.x0 < 10:
+                    continue
+                hs.append((r.x0, r.x1, r.y0))
+                hs.append((r.x0, r.x1, r.y1))
+                vs.append((r.x0, r.y0, r.y1))
+                vs.append((r.x1, r.y0, r.y1))
+    return vs, hs
+
+
+def _vcols(vs, y_lo, y_hi):
+    """Вертикальные x-границы колонок с поддержкой >= 2 строк в диапазоне."""
+    sup = defaultdict(set)
+    for x, ya, yb in vs:
+        if yb < y_lo or ya > y_hi:
+            continue
+        sup[round(x, 1)].add(round((ya + yb) / 2, 0))
+    return sorted(x for x, ys in sup.items() if len(ys) >= 2)
+
+
+def _v2_span(blk, vs, hs, words):
+    """Визуальная проверка блока моделей: x-диапазон таблицы.
+
+    Блок моделей (текстовый фактор) даёт cx и y-диапазон. Визуально находим
+    горизонтальные сегменты сетки в этом y-диапазоне, для каждой строки (y)
+    склеиваем соседние сегменты в максимальные spans, берём span, содержащий
+    cx, и объединяем по всем строкам блока.
+
+    Так работают все страницы каталога одним методом:
+    - страницы с полными линиями-рамками (58, 61): сегмент (71,538) содержит
+      cx → таблица [71,538];
+    - страницы с per-cell сеткой (30, 39, 76): строка собрана из коротких
+      сегментов (67,112)+(112,203)+... → склейка даёт [67,566];
+    - на стр. 58 две таблицы рядом (CKB5-TWN слева, CKB2-TWN справа) делят
+      y-строки, но сегменты по разные стороны зазора не соединяются →
+      границы (71,538) и (647,1129) остаются раздельными.
+
+    ВАЖНО: только горизонтальные сегменты сетки, НЕ токены. Токены «чужой»
+    таблицы на тех же строках (винты M2.5*6, число '2' на границе) «мостиком»
+    соединяли соседние таблицы в одну.
+    """
+    y_lo = blk[0]['cy'] - 3
+    y_hi = blk[-1]['cy'] + 3
+    cx = sum(w['cx'] for w in blk) / len(blk)
+    rows = {}
+    for h0, h1, y in hs:
+        if y_lo - 5 <= y <= y_hi + 5:
+            rows.setdefault(round(y, 0), []).append((h0, h1))
+    spans = []
+    for y, segs in rows.items():
+        segs = sorted(segs)
+        merged = [list(segs[0])]
+        for s in segs[1:]:
+            if s[0] <= merged[-1][1] + 6:
+                merged[-1][1] = max(merged[-1][1], s[1])
+            else:
+                merged.append(list(s))
+        for m in merged:
+            if m[0] <= cx <= m[1]:
+                spans.append((m[0], m[1]))
+    if not spans:
+        return None
+    return (min(s[0] for s in spans), max(s[1] for s in spans))
+
+
+def _v2_find_tables(page, words):
+    """Универсальный поиск таблиц страницы (единый метод для всех стр. 0-83).
+
+    Первичный фактор — колонки кодов из текстового слоя, разбитые по y на
+    блоки-таблицы. Вторичный — визуальная проверка: x-диапазон по
+    горизонтальным сегментам сетки, содержащим cx колонки (см. _v2_span).
+    Возвращает таблицы с полями как у _find_tables (x0, x1, cols, top, bottom,
+    models), чтобы переиспользовать общий код построения строк в parse_page.
+    """
+    vs, hs = _geometry(page)
+    cands = _code_candidates(words)
+    merged = []
+    # числовая Spec-колонка (420-28, TRACK DRILL стр. 52) — модель таблицы
+    # ТОЛЬКО если рядом нет настоящих продуктовых кодов на тех же строках
+    # (иначе это колонка размеров/диапазонов рядом с моделями, напр. 30-31
+    # на стр. 61 рядом с ENH1-2). Вставки (WCMX06..., CC.., SP..) и винты
+    # (M2.5*6) НЕ считаются продуктовыми кодами.
+    letter = [w for w in cands
+              if not re.fullmatch(r'\d{2,}-\d{2,}', w['text'])
+              and not INSERT_RE.search(w['text'])
+              and not MISC_RE.match(w['text'])]
+    for xc in _cluster_x(cands):
+        for blk in _blocks_by_y(xc['tokens']):
+            if len(blk) < 2:
+                continue
+            if re.fullmatch(r'\d{2,}-\d{2,}', blk[0]['text']):
+                # числовая колонка рядом с буквенными кодами на тех же строках?
+                cy0, cy1 = blk[0]['cy'], blk[-1]['cy']
+                nearby = any(cy0 - 8 <= l['cy'] <= cy1 + 8 for l in letter)
+                if nearby:
+                    continue
+            span = _v2_span(blk, vs, hs, words)
+            if not span or span[1] - span[0] < 40:
+                continue
+            # колонка габаритов/винтов (M2.5*6, Φ2.02*180...) — не таблица моделей
+            misc = sum(1 for t in blk if MISC_RE.match(t['text']))
+            if misc > len(blk) // 2:
+                continue
+            # колонка вставок/крепежа (CC..0602.., SP.., M4-0.7*16) — не таблица
+            inserts = sum(1 for t in blk if INSERT_RE.search(t['text']))
+            if inserts > len(blk) // 2:
+                continue
+            # легенды/примечания (материалы, диапазоны прочности) — не таблицы
+            legend = sum(1 for t in blk
+                         if re.search(r'[<>（）()]|N/mm2|%|mm|mm2|/etc', t['text'],
+                                      re.I))
+            if legend > len(blk) // 2:
+                continue
+            # страницы рекомендаций (материалы, параметры резания): типичные
+            # строки — названия материалов/режимов, а не коды моделей.
+            rec = sum(1 for t in blk
+                      if re.search(r'steel|iron|alloy|etc|crmo|Hardened|Inconel'
+                                   r'|Titanium|Aluminium|mm/rev|m/min|ap\.\d'
+                                   r'|Feed|Speed|Vc|fn\s*=|Torque|HRC|SUS\d'
+                                   r'|FC\d|FCD\d|S\d{2}C\b|SS\d{3}\b'
+                                   r'|×|xD\b|\bDc\b'
+                                   r'|^\d+\s*x\s*1000$'
+                                   r'|^[A-Za-z]+\s*x\s*[A-Za-z]+'
+                                   r'|^[\u4e00-\u9fff]',
+                                   t['text'], re.I))
+            if rec > len(blk) // 2:
+                continue
+            y_lo = blk[0]['cy'] - 3
+            y_hi = blk[-1]['cy'] + 3
+            merged.append({'x0': span[0], 'x1': span[1], 'y_lo': y_lo,
+                           'y_hi': y_hi, 'cx': xc['cx'], 'blk': blk,
+                           'model': blk[0]['text']})
+    # слить колонки кодов, попадающие в одну таблицу (винты/вставки/материалы)
+    tabs = []
+    for m in merged:
+        for t in tabs:
+            x_int = min(m['x1'], t['x1']) - max(m['x0'], t['x0'])
+            y_int = min(m['y_hi'], t['y_hi']) - max(m['y_lo'], t['y_lo'])
+            if x_int > 0 and y_int > 0:
+                t['x0'] = min(t['x0'], m['x0'])
+                t['x1'] = max(t['x1'], m['x1'])
+                t['y_lo'] = min(t['y_lo'], m['y_lo'])
+                t['y_hi'] = max(t['y_hi'], m['y_hi'])
+                if m['cx'] < t['cx']:
+                    t['cx'] = m['cx']
+                    t['blk'] = m['blk']
+                    t['model'] = m['model']
+                break
+        else:
+            tabs.append(m)
+    result = []
+    for t in tabs:
+        models = sorted(t['blk'], key=lambda w: w['cy'])
+        y_lo, y_hi = t['y_lo'], t['y_hi']
+        cx = t['cx']
+        # верхняя/нижняя рамка: горизонтальные линии, покрывающие cx модели,
+        # непосредственно над первой и под последней моделью блока.
+        cov = sorted(y for h0, h1, y in hs
+                     if h0 <= cx <= h1 and y_lo - 30 <= y <= y_hi + 30)
+        top_cands = [y for y in cov if y < models[0]['cy'] - 2]
+        bot_cands = [y for y in cov if y > models[-1]['cy'] + 2]
+        top = max(top_cands) if top_cands else y_lo
+        bottom = min(bot_cands) if bot_cands else y_hi
+        bounds = [t['x0']]
+        for b in _vcols(vs, y_lo, y_hi):
+            if t['x0'] < b < t['x1']:
+                bounds.append(b)
+        # границы колонок также по x-концам горизонтальных сегментов (страницы,
+        # нарисованные ячейками-прямоугольниками, где вертикальных линий мало)
+        for h0, h1, y in hs:
+            if not (y_lo - 5 <= y <= y_hi + 5):
+                continue
+            if t['x0'] < h0 < t['x1']:
+                bounds.append(h0)
+            if t['x0'] < h1 < t['x1']:
+                bounds.append(h1)
+        bounds.append(t['x1'])
+        bounds = sorted(set(round(b, 1) for b in bounds))
+        cols = []
+        for i in range(len(bounds) - 1):
+            c0, c1 = bounds[i], bounds[i + 1]
+            if c1 - c0 < 3:
+                continue
+            cols.append({'cx': (c0 + c1) / 2, 'x0': c0, 'x1': c1,
+                         'label': None})
+        result.append({'x0': t['x0'], 'x1': t['x1'], 'cols': cols,
+                       'col_bounds': bounds, 'top': top, 'bottom': bottom,
+                       'models': models, '_v2': True})
+    return result

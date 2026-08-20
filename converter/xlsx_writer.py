@@ -90,10 +90,15 @@ def _sheet_name(table):
     labels = [c.get('label') for c in table['cols']]
     if any(l in ('type', 'diameter', 'Blade model') for l in labels):
         return 'Spare Parts'
+    if table.get('_dim'):
+        return 'Guiding Hole'
     if len(labels) == 3 and 'Dc' in labels:
         return 'C-KSD Series'
     if 'Dc' in labels or 'Dc' in _reliable_set(labels):
         return 'Drilling'
+    if any(l and ('Work Material' in l or 'Hardness' in l or 'Cutting Speed' in l)
+           for l in labels):
+        return 'Recommendation'
     return 'Sheet'
 
 

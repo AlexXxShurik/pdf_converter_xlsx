@@ -12,6 +12,8 @@ def _label_tables(page, tables):
     for t in tables:
         if t.get('sp'):
             continue  # метки уже проставлены в parse_page
+        if t.get('_dim'):
+            continue  # справочная таблица размеров: метки заданы вручную
         labels = ocr_headers(page, t)
         for c, lab in zip(t['cols'], labels):
             c['label'] = lab
